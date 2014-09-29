@@ -852,6 +852,196 @@ SolveQuadraticMatrixProblem(const SpMatrix<Real> &Q,
   }
 }
 
+// Minimizes the negative auxiliary function   -Q(x) = -tr(M^T SigmaInv Y) + 0.5 tr(SigmaInv M Q M^T) 
+// using the constraint M^T M = I, which is called Stiefel manifold
+// Start with a numerically stable version of   M := Y Q^{-1}.
+// Orthogonalize it, 
+// And do line search on the tangent plane with Calyey transform
+template<typename Real> 
+Real 
+SolveQuadraticMatrixProblemOnStiefelManifold(const SpMatrix<Real> &Q,
+                            const MatrixBase<Real> &Y,
+                            const SpMatrix<Real> &SigmaInv,
+                            const SolverOptions &opts, 
+                            MatrixBase<Real> *M,
+                            Real tau,
+                            Real rho_1,
+                            Real rho_2) {
+  
+  // Start with unconstrained problem solving, i.e. M := Y Q^{-1}
+  KALDI_ASSERT(Q.NumRows() == M->NumCols() &&
+               SigmaInv.NumRows() == M->NumRows() && Y.NumRows() == M->NumRows()
+               && Y.NumCols() == M->NumCols() && M->NumCols() != 0);
+  opts.Check();
+  MatrixIndexT rows = M->NumRows(), cols = M->NumCols();  
+  if (Q.IsZero(0.0)) {
+    KALDI_WARN << "Zero quadratic term in quadratic matrix problem for "
+               << opts.name << ": leaving it unchanged.";
+    return 0.0;
+  }
+
+  if (opts.diagonal_precondition) {
+    // We can re-cast the problem with a diagonal preconditioner in the space
+    // of Q (columns of M).  Helps to improve the condition of Q.
+    Vector<Real> Q_diag(cols);
+    Q_diag.CopyDiagFromSp(Q);
+    Q_diag.ApplyFloor(std::numeric_limits<Real>::min() * 1.0E+3);
+    Vector<Real> Q_diag_sqrt(Q_diag);
+    Q_diag_sqrt.ApplyPow(0.5);
+    Vector<Real> Q_diag_inv_sqrt(Q_diag_sqrt);
+    Q_diag_inv_sqrt.InvertElements();
+    Matrix<Real> M_scaled(*M);
+    M_scaled.MulColsVec(Q_diag_sqrt);
+    Matrix<Real> Y_scaled(Y);
+    Y_scaled.MulColsVec(Q_diag_inv_sqrt);
+    SpMatrix<Real> Q_scaled(cols);
+    Q_scaled.AddVec2Sp(1.0, Q_diag_inv_sqrt, Q, 0.0);
+    Real ans;
+    SolverOptions new_opts(opts);
+    new_opts.diagonal_precondition = false;
+    ans = SolveQuadraticMatrixProblemOnStiefelManifold(Q_scaled, Y_scaled, SigmaInv,
+                                      new_opts, &M_scaled, tau, rho_1, rho_2);
+    M->CopyFromMat(M_scaled);
+    M->MulColsVec(Q_diag_inv_sqrt);
+    return ans;
+  }
+  
+  Matrix<Real> Ybar(Y);
+  if (opts.optimize_delta) {
+    Matrix<Real> Qfull(Q);
+    Ybar.AddMatMat(-1.0, *M, kNoTrans, Qfull, kNoTrans, 1.0);
+  } // Ybar = Y - M Q.
+  Matrix<Real> U(cols, cols);
+  Vector<Real> l(cols);
+  Q.SymPosSemiDefEig(&l, &U);  // does svd Q = U L V^T and checks that Q == U L U^T to within a tolerance.
+  // floor l.
+  Real f = std::max<Real>(static_cast<Real>(opts.eps), l.Max() / opts.K);
+  MatrixIndexT nfloored = 0;
+  for (MatrixIndexT i = 0; i < cols; i++) {  // floor l.
+    if (l(i) < f) { nfloored++; l(i) = f; }
+  }
+  if (nfloored != 0 && opts.print_debug_output)
+    KALDI_LOG << "Solving matrix problem for " << opts.name
+              << ": floored " << nfloored << " eigenvalues. ";
+  Matrix<Real> tmpDelta(rows, cols);
+  tmpDelta.AddMatMat(1.0, Ybar, kNoTrans, U, kNoTrans, 0.0);  // tmpDelta = Ybar * U.
+  l.InvertElements(); KALDI_ASSERT(1.0/l.Max() != 0);  // check not infinite.  eps should take care of this.
+  tmpDelta.MulColsVec(l);  // tmpDelta = Ybar * U * \tilde{L}^{-1}
+
+  Matrix<Real> Delta(rows, cols);
+  Delta.AddMatMat(1.0, tmpDelta, kNoTrans, U, kTrans, 0.0);  // Delta = Ybar * U * \tilde{L}^{-1} * U^T
+
+  Real auxf_before, auxf_after;
+  SpMatrix<Real> MQM(rows);
+  Matrix<Real> &SigmaInvY(tmpDelta);
+  //{ 
+  Matrix<Real> SigmaInvFull(SigmaInv);  SigmaInvY.AddMatMat(1.0, SigmaInvFull, kNoTrans, Y, kNoTrans, 0.0); 
+  //}
+  {  // get auxf_before.      Q(x) = tr(M^T SigmaInv Y) - 0.5 tr(SigmaInv M Q M^T).
+    MQM.AddMat2Sp(1.0, *M, kNoTrans, Q, 0.0);
+    auxf_before = TraceMatMat(*M, SigmaInvY, kaldi::kTrans) - 0.5*TraceSpSp(SigmaInv, MQM);
+  }
+
+  Matrix<Real> Mhat(Delta);
+  if (opts.optimize_delta) Mhat.AddMat(1.0, *M);  // Mhat = Delta + M.
+
+  {  // get auxf_after.
+    MQM.AddMat2Sp(1.0, Mhat, kNoTrans, Q, 0.0);
+    auxf_after = TraceMatMat(Mhat, SigmaInvY, kaldi::kTrans) - 0.5*TraceSpSp(SigmaInv, MQM);
+  }
+   	
+  // Now, start line searching:
+  Matrix<Real> MhatO(Mhat);
+  // Gram-Shimitd on row, check for rows and cols
+  if(MhatO.NumRows() <= MhatO.NumCols()) {
+	MhatO.OrthogonalizeRows();
+  }
+  else {
+	Matrix<Real> MhatOT(MhatO.NumCols(), MhatO.NumRows());
+	MhatOT.CopyFromMat(MhatO, kTrans);
+	MhatOT.OrthogonalizeRows();
+	MhatO.CopyFromMat(MhatOT, kTrans);
+  }
+  // Compute G:
+  Matrix<Real> G(SigmaInvFull.NumRows(), Y.NumCols());
+  G.AddMatMat(-1.0, SigmaInvFull, kNoTrans, Ybar, kNoTrans, 0.0);
+  Matrix<Real> MinusG(G);
+  MinusG.Scale(-1.0);
+
+  // Get U and V, U = [G M], V = [M -G], A = G M^T - M G^T = U V^T
+  Matrix<Real> U_cayley(G.NumRows(), G.NumCols() + MhatO.NumCols());
+  Matrix<Real> V_cayley(G.NumRows(), G.NumCols() + MhatO.NumCols());
+  U_cayley.Range(0, G.NumRows(), 0, G.NumCols()).CopyFromMat(G);
+  U_cayley.Range(0, G.NumRows(), G.NumCols(), MhatO.NumCols()).CopyFromMat(MhatO);
+  V_cayley.Range(0, G.NumRows(), 0, MhatO.NumCols()).CopyFromMat(MhatO);
+  V_cayley.Range(0, G.NumRows(), MhatO.NumCols(), MinusG.NumCols()).CopyFromMat(MinusG);
+  Matrix<Real> A(G.NumRows(), G.NumRows());
+  A.AddMatMat(1.0, G, kNoTrans, MhatO, kTrans, 0.0);
+  A.AddMatMat(-1.0, MhatO, kNoTrans, G, kTrans, 1.0);
+
+  Matrix<Real> I(A.NumRows(), A.NumCols());
+  I.SetUnit();
+  Matrix<Real> DYtauDtau0(A.NumRows(), MhatO.NumCols());
+  DYtauDtau0.AddMatMat(-1.0, A, kNoTrans, MhatO, kNoTrans, 0.0);
+  Matrix<Real> DFYtauDtau0(G.NumCols(), MhatO.NumCols());
+  DFYtauDtau0.AddMatMat(1.0, G, kTrans, DYtauDtau0, kNoTrans, 0.0);
+  Real trDFYtauDtau0 = DFYtauDtau0.Trace();
+  MQM.AddMat2Sp(1.0, MhatO, kNoTrans, Q, 0.0);
+  Real FYtau0 = 0.5*TraceSpSp(SigmaInv, MQM) - TraceMatMat(MhatO, SigmaInvY, kaldi::kTrans);
+  Real FYtau = FYtau0;
+  Real trDFYtauDtau = trDFYtauDtau0;
+  Matrix<Real> Ytau(A.NumRows(), MhatO.NumCols());  
+  // Now, we first try brute force Cayley transform
+  // i.e. did not use matrix inversion lemma
+  
+  // compute necessary components at tau
+  do {
+    Real halftau = 0.5 * tau;
+    Matrix<Real> Ytau1(I);
+    Matrix<Real> Ytau2(I);
+    Ytau1.AddMat(halftau, A);
+    Ytau2.AddMat(-halftau, A);
+    Ytau1.Invert();
+    Ytau.AddMatMatMat(1.0, Ytau1, kNoTrans, Ytau2, kNoTrans, MhatO, kNoTrans, 0.0);
+    Matrix<Real> YtauMhalf(MhatO);
+    YtauMhalf.Scale(0.5);
+    YtauMhalf.AddMat(0.5, Ytau);
+    Matrix<Real> DYtauDtau(A.NumRows(), MhatO.NumCols());
+    DYtauDtau.AddMatMatMat(-1.0, Ytau1, kNoTrans, A, kNoTrans, YtauMhalf, kNoTrans, 0.0);
+    Matrix<Real> DFYtauDtau(G.NumCols(), MhatO.NumCols());
+    DFYtauDtau.AddMatMat(1.0, G, kTrans, DYtauDtau, kNoTrans, 0.0);
+    Real trDFYtauDtau = DFYtauDtau.Trace();
+    MQM.AddMat2Sp(1.0, Ytau, kNoTrans, Q, 0.0);
+    FYtau = 0.5*TraceSpSp(SigmaInv, MQM) - TraceMatMat(Ytau, SigmaInvY, kaldi::kTrans);
+    tau = halftau;
+  }while(!((FYtau <= FYtau0 + rho_1 * tau * trDFYtauDtau0)&&(trDFYtauDtau >= rho_2 * trDFYtauDtau0)));
+    
+  // if (auxf_after < auxf_before) {
+    // if (auxf_after < auxf_before - 1.0e-10)
+      // KALDI_WARN << "Optimizing matrix auxiliary function for "
+                 // << opts.name << ", auxf decreased "
+                 // << auxf_before << " to " << auxf_after << ", change is "
+                 // << (auxf_after-auxf_before);
+    // return 0.0;
+  // } else {
+    // M->CopyFromMat(Mhat);
+    // return auxf_after - auxf_before;
+  // }
+  if (FYtau < FYtau0) {
+    if (FYtau < FYtau0 - 1.0e-10)
+      KALDI_WARN << "Optimizing matrix auxiliary function for "
+                 << opts.name << ", auxf decreased "
+                 << FYtau0 << " to " << FYtau << ", change is "
+                 << (FYtau-FYtau0);
+    return 0.0;
+  } else {
+    M->CopyFromMat(Ytau);
+    return FYtau - FYtau0;
+  }
+  
+}
+
+
 template<typename Real>
 Real SolveDoubleQuadraticMatrixProblem(const MatrixBase<Real> &G,
                                        const SpMatrix<Real> &P1,
@@ -1220,6 +1410,25 @@ template double SolveQuadraticMatrixProblem(const SpMatrix<double> &Q,
                                             const SpMatrix<double> &SigmaInv,
                                             const SolverOptions &opts,
                                             MatrixBase<double> *M);
+
+// Instantiate the template above.
+template float SolveQuadraticMatrixProblemOnStiefelManifold(const SpMatrix<float> &Q,
+                                           const MatrixBase<float> &Y,
+                                           const SpMatrix<float> &SigmaInv,
+                                           const SolverOptions &opts,
+                                           MatrixBase<float> *M,
+                                           float tau,
+                                           float rho_1, 
+                                           float rho_2);
+template double SolveQuadraticMatrixProblemOnStiefelManifold(const SpMatrix<double> &Q,
+                                            const MatrixBase<double> &Y,
+                                            const SpMatrix<double> &SigmaInv,
+                                            const SolverOptions &opts,
+                                            MatrixBase<double> *M,
+                                            double tau,
+                                            double rho_1, 
+                                            double rho_2);
+
                                             
 // Instantiate the template above.
 template float SolveDoubleQuadraticMatrixProblem(

@@ -22,6 +22,191 @@
 
 namespace kaldi {
 
+// debug functions
+double MySolveQuadraticMatrixProblemOnStiefelManifold(const SpMatrix<double> &Q,
+                            const MatrixBase<double> &Y,
+                            const SpMatrix<double> &SigmaInv,
+                            const SolverOptions &opts, 
+                            MatrixBase<double> *M,
+                            double tau,
+                            double rho_1,
+                            double rho_2) {
+  
+  // Start with unconstrained problem solving, i.e. M := Y Q^{-1}
+  KALDI_ASSERT(Q.NumRows() == M->NumCols() &&
+               SigmaInv.NumRows() == M->NumRows() && Y.NumRows() == M->NumRows()
+               && Y.NumCols() == M->NumCols() && M->NumCols() != 0);
+  opts.Check();
+  MatrixIndexT rows = M->NumRows(), cols = M->NumCols();  
+  if (Q.IsZero(0.0)) {
+    KALDI_WARN << "Zero quadratic term in quadratic matrix problem for "
+               << opts.name << ": leaving it unchanged.";
+    return 0.0;
+  }
+
+  if (opts.diagonal_precondition) {
+    // We can re-cast the problem with a diagonal preconditioner in the space
+    // of Q (columns of M).  Helps to improve the condition of Q.
+    Vector<double> Q_diag(cols);
+    Q_diag.CopyDiagFromSp(Q);
+    Q_diag.ApplyFloor(std::numeric_limits<double>::min() * 1.0E+3);
+    Vector<double> Q_diag_sqrt(Q_diag);
+    Q_diag_sqrt.ApplyPow(0.5);
+    Vector<double> Q_diag_inv_sqrt(Q_diag_sqrt);
+    Q_diag_inv_sqrt.InvertElements();
+    Matrix<double> M_scaled(*M);
+    M_scaled.MulColsVec(Q_diag_sqrt);
+    Matrix<double> Y_scaled(Y);
+    Y_scaled.MulColsVec(Q_diag_inv_sqrt);
+    SpMatrix<double> Q_scaled(cols);
+    Q_scaled.AddVec2Sp(1.0, Q_diag_inv_sqrt, Q, 0.0);
+    double ans;
+    SolverOptions new_opts(opts);
+    new_opts.diagonal_precondition = false;
+    ans = SolveQuadraticMatrixProblemOnStiefelManifold(Q_scaled, Y_scaled, SigmaInv,
+                                      new_opts, &M_scaled, tau, rho_1, rho_2);
+    M->CopyFromMat(M_scaled);
+    M->MulColsVec(Q_diag_inv_sqrt);
+    return ans;
+  }
+  
+  Matrix<double> Ybar(Y);
+  if (opts.optimize_delta) {
+    Matrix<double> Qfull(Q);
+    Ybar.AddMatMat(-1.0, *M, kNoTrans, Qfull, kNoTrans, 1.0);
+  } // Ybar = Y - M Q.
+  Matrix<double> U(cols, cols);
+  Vector<double> l(cols);
+  Q.SymPosSemiDefEig(&l, &U);  // does svd Q = U L V^T and checks that Q == U L U^T to within a tolerance.
+  // floor l.
+  double f = std::max<double>(static_cast<double>(opts.eps), l.Max() / opts.K);
+  MatrixIndexT nfloored = 0;
+  for (MatrixIndexT i = 0; i < cols; i++) {  // floor l.
+    if (l(i) < f) { nfloored++; l(i) = f; }
+  }
+  if (nfloored != 0 && opts.print_debug_output)
+    KALDI_LOG << "Solving matrix problem for " << opts.name
+              << ": floored " << nfloored << " eigenvalues. ";
+  Matrix<double> tmpDelta(rows, cols);
+  tmpDelta.AddMatMat(1.0, Ybar, kNoTrans, U, kNoTrans, 0.0);  // tmpDelta = Ybar * U.
+  l.InvertElements(); KALDI_ASSERT(1.0/l.Max() != 0);  // check not infinite.  eps should take care of this.
+  tmpDelta.MulColsVec(l);  // tmpDelta = Ybar * U * \tilde{L}^{-1}
+
+  Matrix<double> Delta(rows, cols);
+  Delta.AddMatMat(1.0, tmpDelta, kNoTrans, U, kTrans, 0.0);  // Delta = Ybar * U * \tilde{L}^{-1} * U^T
+
+  double auxf_before, auxf_after;
+  SpMatrix<double> MQM(rows);
+  Matrix<double> &SigmaInvY(tmpDelta);
+  //{ 
+  Matrix<double> SigmaInvFull(SigmaInv);  SigmaInvY.AddMatMat(1.0, SigmaInvFull, kNoTrans, Y, kNoTrans, 0.0); 
+  //}
+  {  // get auxf_before.      Q(x) = tr(M^T SigmaInv Y) - 0.5 tr(SigmaInv M Q M^T).
+    MQM.AddMat2Sp(1.0, *M, kNoTrans, Q, 0.0);
+    auxf_before = TraceMatMat(*M, SigmaInvY, kaldi::kTrans) - 0.5*TraceSpSp(SigmaInv, MQM);
+  }
+
+  Matrix<double> Mhat(Delta);
+  if (opts.optimize_delta) Mhat.AddMat(1.0, *M);  // Mhat = Delta + M.
+
+  {  // get auxf_after.
+    MQM.AddMat2Sp(1.0, Mhat, kNoTrans, Q, 0.0);
+    auxf_after = TraceMatMat(Mhat, SigmaInvY, kaldi::kTrans) - 0.5*TraceSpSp(SigmaInv, MQM);
+  }
+   	
+  // Now, start line searching:
+  Matrix<double> MhatO(Mhat);
+  // Gram-Shimitd on row, check for rows and cols
+  if(MhatO.NumRows() <= MhatO.NumCols()) {
+	MhatO.OrthogonalizeRows();
+  }
+  else {
+	Matrix<double> MhatOT(MhatO.NumCols(), MhatO.NumRows());
+	MhatOT.CopyFromMat(MhatO, kTrans);
+	MhatOT.OrthogonalizeRows();
+	MhatO.CopyFromMat(MhatOT, kTrans);
+  }
+  // Compute G:
+  Matrix<double> G(SigmaInvFull.NumRows(), Y.NumCols());
+  G.AddMatMat(-1.0, SigmaInvFull, kNoTrans, Ybar, kNoTrans, 0.0);
+  Matrix<double> MinusG(G);
+  MinusG.Scale(-1.0);
+
+  // Get U and V, U = [G M], V = [M -G], A = G M^T - M G^T = U V^T
+  Matrix<double> U_cayley(G.NumRows(), G.NumCols() + MhatO.NumCols());
+  Matrix<double> V_cayley(G.NumRows(), G.NumCols() + MhatO.NumCols());
+  U_cayley.Range(0, G.NumRows(), 0, G.NumCols()).CopyFromMat(G);
+  U_cayley.Range(0, G.NumRows(), G.NumCols(), MhatO.NumCols()).CopyFromMat(MhatO);
+  V_cayley.Range(0, G.NumRows(), 0, MhatO.NumCols()).CopyFromMat(MhatO);
+  V_cayley.Range(0, G.NumRows(), MhatO.NumCols(), MinusG.NumCols()).CopyFromMat(MinusG);
+  Matrix<double> A(G.NumRows(), G.NumRows());
+  A.AddMatMat(1.0, G, kNoTrans, MhatO, kTrans, 0.0);
+  A.AddMatMat(-1.0, MhatO, kNoTrans, G, kTrans, 1.0);
+
+  Matrix<double> I(A.NumRows(), A.NumCols());
+  I.SetUnit();
+  Matrix<double> DYtauDtau0(A.NumRows(), MhatO.NumCols());
+  DYtauDtau0.AddMatMat(-1.0, A, kNoTrans, MhatO, kNoTrans, 0.0);
+  Matrix<double> DFYtauDtau0(G.NumCols(), MhatO.NumCols());
+  DFYtauDtau0.AddMatMat(1.0, G, kTrans, DYtauDtau0, kNoTrans, 0.0);
+  double trDFYtauDtau0 = DFYtauDtau0.Trace();
+  MQM.AddMat2Sp(1.0, MhatO, kNoTrans, Q, 0.0);
+  double FYtau0 = 0.5*TraceSpSp(SigmaInv, MQM) - TraceMatMat(MhatO, SigmaInvY, kaldi::kTrans);
+  double FYtau = FYtau0;
+  double trDFYtauDtau = trDFYtauDtau0;
+  Matrix<double> Ytau(A.NumRows(), MhatO.NumCols());  
+  // Now, we first try brute force Cayley transform
+  // i.e. did not use matrix inversion lemma
+  
+  // compute necessary components at tau
+  do {
+    double halftau = 0.5 * tau;
+    Matrix<double> Ytau1(I);
+    Matrix<double> Ytau2(I);
+    Ytau1.AddMat(halftau, A);
+    Ytau2.AddMat(-halftau, A);
+    Ytau1.Invert();
+    Ytau.AddMatMatMat(1.0, Ytau1, kNoTrans, Ytau2, kNoTrans, MhatO, kNoTrans, 0.0);
+    Matrix<double> YtauMhalf(MhatO);
+    YtauMhalf.Scale(0.5);
+    YtauMhalf.AddMat(0.5, Ytau);
+    Matrix<double> DYtauDtau(A.NumRows(), MhatO.NumCols());
+    DYtauDtau.AddMatMatMat(-1.0, Ytau1, kNoTrans, A, kNoTrans, YtauMhalf, kNoTrans, 0.0);
+    Matrix<double> DFYtauDtau(G.NumCols(), MhatO.NumCols());
+    DFYtauDtau.AddMatMat(1.0, G, kTrans, DYtauDtau, kNoTrans, 0.0);
+    double trDFYtauDtau = DFYtauDtau.Trace();
+    MQM.AddMat2Sp(1.0, Ytau, kNoTrans, Q, 0.0);
+    FYtau = 0.5*TraceSpSp(SigmaInv, MQM) - TraceMatMat(Ytau, SigmaInvY, kaldi::kTrans);
+    tau = halftau;
+  }while(!((FYtau <= FYtau0 + rho_1 * tau * trDFYtauDtau0)&&(trDFYtauDtau >= rho_2 * trDFYtauDtau0)));
+    
+  // if (auxf_after < auxf_before) {
+    // if (auxf_after < auxf_before - 1.0e-10)
+      // KALDI_WARN << "Optimizing matrix auxiliary function for "
+                 // << opts.name << ", auxf decreased "
+                 // << auxf_before << " to " << auxf_after << ", change is "
+                 // << (auxf_after-auxf_before);
+    // return 0.0;
+  // } else {
+    // M->CopyFromMat(Mhat);
+    // return auxf_after - auxf_before;
+  // }
+  if (FYtau < FYtau0) {
+    if (FYtau < FYtau0 - 1.0e-10)
+      KALDI_WARN << "Optimizing matrix auxiliary function for "
+                 << opts.name << ", auxf decreased "
+                 << FYtau0 << " to " << FYtau << ", change is "
+                 << (FYtau-FYtau0);
+    return 0.0;
+  } else {
+    M->CopyFromMat(Ytau);
+    return FYtau - FYtau0;
+  }
+  
+}
+//
+
+
 int32 IvectorExtractor::FeatDim() const {
   KALDI_ASSERT(!M_.empty());
   return M_[0].NumRows();
@@ -1023,16 +1208,33 @@ double IvectorStats::UpdateProjection(
   SolverOptions solver_opts;
   solver_opts.name = "M";
   solver_opts.diagonal_precondition = true;
-  double impr = SolveQuadraticMatrixProblem(R, Y_[i], SigmaInv, solver_opts, &M),
-      gamma = gamma_(i);
+  //if(opts.tau == 0.0) {
+  double impr = SolveQuadraticMatrixProblem(R, Y_[i], SigmaInv, solver_opts, &M), gamma = gamma_(i);   
   if (i < 4) {
     KALDI_VLOG(1) << "Objf impr for M for Gaussian index " << i << " is "
                   << (impr / gamma) << " per frame over " << gamma << " frames.";
   }
   extractor->M_[i].CopyFromMat(M);
   return impr;
+  //} 
+  //else{
+    //double impr = MySolveQuadraticMatrixProblemOnStiefelManifold(R, Y_[i], SigmaInv, solver_opts, &M, opts.tau, opts.rho_1, opts.rho_2);
+    //gamma = gamma_(i);
+    
+    //if (i < 4) {
+    //  KALDI_VLOG(1) << "Objf impr for M for Gaussian index " << i << " is "
+    //                << (impr / gamma) << " per frame over " << gamma << " frames.";
+    //}
+    //extractor->M_[i].CopyFromMat(M);
+    //return impr;
+  //}
+  //if (i < 4) {
+  //  KALDI_VLOG(1) << "Objf impr for M for Gaussian index " << i << " is "
+  //                << (impr / gamma) << " per frame over " << gamma << " frames.";
+  //}
+  //extractor->M_[i].CopyFromMat(M);
+  //return impr;
 }
-
 class IvectorExtractorUpdateProjectionClass {
  public:
   IvectorExtractorUpdateProjectionClass(const IvectorStats &stats,
@@ -1059,6 +1261,10 @@ double IvectorStats::UpdateProjections(
     const IvectorExtractorEstimationOptions &opts,
     IvectorExtractor *extractor) const {
   int32 I = extractor->NumGauss();
+  std::vector< Matrix<double> > oldM_(I);
+  for(int32 i = 0; i < I; ++i) {
+    oldM_[i] = Matrix<double>(extractor->M_[i]);
+  }
   double tot_impr = 0.0;
   {
     TaskSequencerConfig sequencer_opts;
@@ -1073,6 +1279,247 @@ double IvectorStats::UpdateProjections(
   KALDI_LOG << "Overall objective function improvement for M (mean projections) "
             << "was " << (tot_impr / count) << " per frame over "
             << count << " frames.";
+  // Now, if we would like to do Stiefel manifold optimization, we have to add it here
+  if(opts.do_orthogonalization) {
+    MatrixIndexT nD = (MatrixIndexT)extractor->FeatDim();
+    MatrixIndexT nS = (MatrixIndexT)extractor->IvectorDim();
+    MatrixIndexT nI = (MatrixIndexT)extractor->NumGauss();
+    std::vector< SpMatrix<double> > Rs(nI);
+    std::vector< Matrix<double> > SigmaInvFulls(nI, Matrix<double>(nD,nD));
+    std::vector< Matrix<double> > SigmaInvYs(nI, Matrix<double>(nD,nS));
+    SpMatrix<double> MQM(nD);
+    SpMatrix<double> MQM0(nD);
+    double FYtau_not_orthogonal = 0.0;
+    double OldFYtau = 0.0;
+    // compute before orthogonalization result:
+    for(MatrixIndexT i = 0; i < nI; ++i) {
+      SigmaInvFulls[i].CopyFromSp(extractor->Sigma_inv_[i]);
+      SigmaInvYs[i].AddMatMat(1.0, SigmaInvFulls[i], kNoTrans, Y_[i], kNoTrans, 0.0);
+      Rs[i] = SpMatrix<double>(nS, kUndefined);
+      SubVector<double> R_vec(R_, i); // i'th row of R; vectorized form of SpMatrix.
+      SubVector<double> R_sp(Rs[i].Data(), nS * (nS+1) / 2);
+      R_sp.CopyFromVec(R_vec); // copy to SpMatrix's memory.
+      MQM.AddMat2Sp(1.0, extractor->M_[i], kNoTrans, Rs[i], 0.0);
+      MQM0.AddMat2Sp(1.0, oldM_[i], kNoTrans, Rs[i], 0.0);
+      double f0i = 0.5*TraceSpSp(extractor->Sigma_inv_[i], MQM) - TraceMatMat(extractor->M_[i], SigmaInvYs[i], kTrans);
+      FYtau_not_orthogonal += f0i;
+      //std::cout<<"Before orthogonalization, the component "<<i<<" has value "<<f0i<<std::endl;
+      OldFYtau += 0.5*TraceSpSp(extractor->Sigma_inv_[i], MQM0) - TraceMatMat(oldM_[i], SigmaInvYs[i], kTrans);
+    }
+    // Make big matrix M from all mixtures (join, like matlab syntax M = [M_0;M_1;...;M_I])
+    Matrix<double> M(nI*nD, nS);
+    Matrix<double> MT(nS,nI*nD);
+    for(MatrixIndexT i = 0; i < nI; ++i) {
+      M.Range(i*nD, nD, 0, nS).CopyFromMat(extractor->M_[i]);
+    }
+    // Orthogonalize the big matrix M
+    MT.CopyFromMat(M, kTrans);
+    MT.OrthogonalizeRows();
+    M.CopyFromMat(MT, kTrans);
+    //Matrix<double> MTM(nS, nS);
+    //MTM.AddMatMat(1.0, MT, kNoTrans, M, kNoTrans, 0.0);
+    //std::ofstream fout("/home/you-chi/kaldi-trunk/src/debugMTM.log");
+    //fout<<MTM;
+    //fout<<endl;
+    //fout.close();
+    // Put back the orthogonalized one if no Stiefel manifold constraint, otherwise, do Stiefel manifold optimization
+    for(MatrixIndexT i = 0; i < nI; ++i) {
+      extractor->M_[i].CopyFromMat(M.Range(i*nD, nD, 0, nS));
+    }      
+    if(opts.tau > 0.0) {
+      std::vector< Matrix<double> > Gs(nI, Matrix<double>(nD,nS));
+      std::vector< Matrix<double> > As(nI, Matrix<double>(nD,nD));
+      std::vector< Matrix<double> > Ytaus(nI, Matrix<double>(nD,nS));
+      
+      Matrix<double> Ii(nD, nD);
+      double FYtau = 0.0;
+      double FYtau0 = 0.0;
+      double trDFYtauDtau = 0.0;
+      double trDFYtauDtau0 = 0.0;
+      Ii.SetUnit();
+      // Compute initial value for line search
+      for(MatrixIndexT i = 0; i < nI; ++i) {
+        Matrix<double> Ybar(Y_[i]);
+        Matrix<double> Rfull(Rs[i]);
+        // Compute Gi and Ai
+        Ybar.AddMatMat(-1.0, extractor->M_[i], kNoTrans, Rfull, kNoTrans, 1.0);
+        Gs[i].AddMatMat(-1.0, SigmaInvFulls[i], kNoTrans, Ybar, kNoTrans, 0.0);
+        As[i].AddMatMat(1.0, extractor->M_[i], kNoTrans, Gs[i], kTrans, 0.0);
+        As[i].AddMatMat(1.0, Gs[i], kNoTrans, extractor->M_[i], kTrans, -1.0);
+        Matrix<double> DYtauDtau0i(nD, nS);
+        DYtauDtau0i.AddMatMat(-1.0, As[i], kNoTrans, extractor->M_[i], kNoTrans, 0.0);
+        Matrix<double> DFYtauDtau0i(nS, nS);
+        DFYtauDtau0i.AddMatMat(1.0, Gs[i], kTrans, DYtauDtau0i, kNoTrans, 0.0);  
+        double dfy_i = DFYtauDtau0i.Trace();
+        trDFYtauDtau0 += dfy_i;
+        
+        MQM.AddMat2Sp(1.0, extractor->M_[i], kNoTrans, Rs[i], 0.0);
+        double fy_i = (0.5*TraceSpSp(extractor->Sigma_inv_[i], MQM) - TraceMatMat(extractor->M_[i], SigmaInvYs[i], kTrans));
+        FYtau0 += fy_i;
+        //std::cout<<"For component "<<i<<", F(Y)_i and DF(Y)_i are "<<fy_i<<","<<dfy_i<<std::endl;
+      }
+      // start line search
+      double tau = opts.tau;
+      //double minstep = 1.0e-9;
+      //double tau_max = opts.tau;
+      //double tau = tau_max * 0.5;
+      double oldtau = 0.0;
+      //double tau_low = 0.0;
+      //double tau_high = 0.0;
+      //double FYoldtau = FYtau0;
+      //double abstrDFYtauDtau0 = (trDFYtauDtau0>=0)?trDFYtauDtau0:-trDFYtauDtau0;
+      int32 itr = 1;
+      do
+      //while(1)
+      {
+        double halftau = tau * 0.5;
+        trDFYtauDtau = 0.0;
+        FYtau = 0.0;
+        for(MatrixIndexT i = 0; i < nI; ++i) {
+          Matrix<double> Ytau1i(Ii);
+          Matrix<double> Ytau2i(Ii);
+          Ytau1i.AddMat(halftau, As[i]);
+          Ytau2i.AddMat(-halftau, As[i]);
+          Ytau1i.Invert();
+          Ytaus[i].AddMatMatMat(1.0, Ytau1i, kNoTrans, Ytau2i, kNoTrans, extractor->M_[i], kNoTrans, 0.0);
+          Matrix<double> YtauMhalfi(extractor->M_[i]);
+          YtauMhalfi.Scale(0.5);
+          YtauMhalfi.AddMat(0.5, Ytaus[i]);
+          Matrix<double> DYtauDtaui(nD, nS);
+          DYtauDtaui.AddMatMatMat(-1.0, Ytau1i, kNoTrans, As[i], kNoTrans, YtauMhalfi, kNoTrans, 0.0);
+          Matrix<double> DFYtauDtaui(nS, nS);
+          DFYtauDtaui.AddMatMat(1.0, Gs[i], kTrans, DYtauDtaui, kNoTrans, 0.0);
+          double dfy_i = DFYtauDtaui.Trace();
+          trDFYtauDtau += dfy_i;
+          MQM.AddMat2Sp(1.0, Ytaus[i], kNoTrans, Rs[i], 0.0);
+          double fy_i = 0.5*TraceSpSp(extractor->Sigma_inv_[i], MQM) - TraceMatMat(Ytaus[i], SigmaInvYs[i], kTrans);
+          FYtau += fy_i;
+          //std::cout<<"For component "<<i<<", F(Y)_i and DF(Y)_i are "<<fy_i<<","<<dfy_i<<std::endl;
+        }
+        oldtau = tau;
+        tau = halftau;
+        /*
+        if(FYtau > FYtau0 + opts.rho_1 * tau * trDFYtauDtau0 || (FYtau >= FYoldtau &&itr > 1)) {
+          double FYtau_low = FYoldtau;
+          tau_low = oldtau;
+          tau_high = tau;
+          while(1) {
+            tau = (tau_low + tau_high) * 0.5; // simple midpoint
+            halftau = tau * 0.5;
+            FYtau = 0.0;
+            for(MatrixIndexT i = 0; i < nI; ++i) {
+              Matrix<double> Ytau1i(Ii);
+              Matrix<double> Ytau2i(Ii);
+              Ytau1i.AddMat(halftau, As[i]);
+              Ytau2i.AddMat(-halftau, As[i]);
+              Ytau1i.Invert();
+              Ytaus[i].AddMatMatMat(1.0, Ytau1i, kNoTrans, Ytau2i, kNoTrans, extractor->M_[i], kNoTrans, 0.0);
+              Matrix<double> YtauMhalfi(extractor->M_[i]);
+              YtauMhalfi.Scale(0.5);
+              YtauMhalfi.AddMat(0.5, Ytaus[i]);
+              Matrix<double> DYtauDtaui(nD, nS);
+              DYtauDtaui.AddMatMatMat(-1.0, Ytau1i, kNoTrans, As[i], kNoTrans, YtauMhalfi, kNoTrans, 0.0);
+              Matrix<double> DFYtauDtaui(nS, nS);
+              DFYtauDtaui.AddMatMat(1.0, Gs[i], kTrans, DYtauDtaui, kNoTrans, 0.0);
+              double dfy_i = DFYtauDtaui.Trace();
+              trDFYtauDtau += dfy_i;
+              MQM.AddMat2Sp(1.0, Ytaus[i], kNoTrans, Rs[i], 0.0);
+              double fy_i = 0.5*TraceSpSp(extractor->Sigma_inv_[i], MQM) - TraceMatMat(Ytaus[i], SigmaInvYs[i], kTrans);
+              FYtau += fy_i;
+              //std::cout<<"For component "<<i<<", F(Y)_i and DF(Y)_i are "<<fy_i<<","<<dfy_i<<std::endl;
+            }
+            if(FYtau > FYtau0 + opts.rho_1 * tau * trDFYtauDtau0 || FYtau >= FYtau_low) {
+              tau_high = tau;
+            }
+            else {
+              double abstrDFYtauDtau = (trDFYtauDtau>=0)?trDFYtauDtau:-trDFYtauDtau;
+              if(abstrDFYtauDtau <= opts.rho_2 * abstrDFYtauDtau0)
+                break;
+              else if(trDFYtauDtau*(tau_high-tau_low) >= 0)
+                tau_high = tau_low;
+              tau_low = tau;
+              FYtau_low = FYtau;               
+            }
+          }
+          break;
+        }
+        else if(((trDFYtauDtau>=0)?trDFYtauDtau:-trDFYtauDtau) <= opts.rho_2 * abstrDFYtauDtau0)
+          break;
+        else if(trDFYtauDtau >= 0) {
+          double FYtau_low = FYtau;
+          tau_low = tau;
+          tau_high = tau_max;
+          while(1) {
+            FYtau = 0.0;
+            tau = (tau_low + tau_high) * 0.5; // simple midpoint
+            halftau = tau * 0.5;
+            for(MatrixIndexT i = 0; i < nI; ++i) {
+              Matrix<double> Ytau1i(Ii);
+              Matrix<double> Ytau2i(Ii);
+              Ytau1i.AddMat(halftau, As[i]);
+              Ytau2i.AddMat(-halftau, As[i]);
+              Ytau1i.Invert();
+              Ytaus[i].AddMatMatMat(1.0, Ytau1i, kNoTrans, Ytau2i, kNoTrans, extractor->M_[i], kNoTrans, 0.0);
+              Matrix<double> YtauMhalfi(extractor->M_[i]);
+              YtauMhalfi.Scale(0.5);
+              YtauMhalfi.AddMat(0.5, Ytaus[i]);
+              Matrix<double> DYtauDtaui(nD, nS);
+              DYtauDtaui.AddMatMatMat(-1.0, Ytau1i, kNoTrans, As[i], kNoTrans, YtauMhalfi, kNoTrans, 0.0);
+              Matrix<double> DFYtauDtaui(nS, nS);
+              DFYtauDtaui.AddMatMat(1.0, Gs[i], kTrans, DYtauDtaui, kNoTrans, 0.0);
+              double dfy_i = DFYtauDtaui.Trace();
+              trDFYtauDtau += dfy_i;
+              MQM.AddMat2Sp(1.0, Ytaus[i], kNoTrans, Rs[i], 0.0);
+              double fy_i = 0.5*TraceSpSp(extractor->Sigma_inv_[i], MQM) - TraceMatMat(Ytaus[i], SigmaInvYs[i], kTrans);
+              FYtau += fy_i;
+              //std::cout<<"For component "<<i<<", F(Y)_i and DF(Y)_i are "<<fy_i<<","<<dfy_i<<std::endl;
+            }
+            if(FYtau > FYtau0 + opts.rho_1 * tau * trDFYtauDtau0 || FYtau >= FYtau_low) {
+              tau_high = tau;
+            }
+            else {
+              double abstrDFYtauDtau = (trDFYtauDtau>=0)?trDFYtauDtau:-trDFYtauDtau;
+              if(abstrDFYtauDtau <= opts.rho_2 * abstrDFYtauDtau0)
+                break;
+              else if(trDFYtauDtau*(tau_high-tau_low) >= 0)
+                tau_high = tau_low;
+              tau_low = tau;
+              FYtau_low = FYtau;               
+            }
+          }
+          break;
+        }
+        tau = (tau < tau_max / 2.0)?tau * 2.0:tau_max; //or + minstep
+        FYoldtau = FYtau;
+        itr++;
+        */
+      }
+      while(!(
+        (FYtau <= FYtau0 + opts.rho_1 * oldtau * trDFYtauDtau0) //&&  
+        //(trDFYtauDtau >= opts.rho_2 * trDFYtauDtau0)
+       )
+      );
+      // store back Ytau
+      for(MatrixIndexT i = 0; i < nI; ++i) {
+        extractor->M_[i].CopyFromMat(Ytaus[i]);
+      }
+      return (OldFYtau - FYtau) / count;        
+    }
+    else{
+      double FYtau0 = 0.0;
+      for(MatrixIndexT i = 0; i < nI; ++i) {
+        MQM.AddMat2Sp(1.0, extractor->M_[i], kNoTrans, Rs[i], 0.0);
+        double fy_i = (0.5*TraceSpSp(extractor->Sigma_inv_[i], MQM) - TraceMatMat(extractor->M_[i], SigmaInvYs[i], kTrans));
+        FYtau0 += fy_i;
+        //std::cout<<"For component "<<i<<", F(Y)_i and DF(Y)_i are "<<fy_i<<","<<dfy_i<<std::endl;
+      }
+
+      return (OldFYtau - FYtau0) / count; 
+    }
+  }
+  else {
+    return tot_impr / count;
+  }
   return tot_impr / count;
 }
 

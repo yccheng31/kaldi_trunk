@@ -496,6 +496,19 @@ Real SolveQuadraticMatrixProblem(const SpMatrix<Real> &Q,
                                  const SolverOptions &opts,
                                  MatrixBase<Real> *M);
 
+								 
+/// Adding Stiefel manifold constraint to the previous problem:
+template<typename Real>
+Real SolveQuadraticMatrixProblemOnStiefelManifold(const SpMatrix<Real> &Q,
+                                 const MatrixBase<Real> &Y,
+                                 const SpMatrix<Real> &P,
+                                 const SolverOptions &opts,
+                                 MatrixBase<Real> *M,
+                                 Real tau,
+                                 Real rho_1,
+                                 Real rho_2);
+								 
+								 
 /// Maximizes the auxiliary function :
 /// \f[   Q(M) =  tr(M^T G) -0.5 tr(P_1 M Q_1 M^T) -0.5 tr(P_2 M Q_2 M^T).   \f]
 /// Encountered in matrix update with a prior. We also apply a limit on the

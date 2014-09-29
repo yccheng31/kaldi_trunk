@@ -316,9 +316,18 @@ struct IvectorStatsOptions {
 struct IvectorExtractorEstimationOptions {
   double variance_floor_factor;
   double gaussian_min_count;
+  double tau;
+  double rho_1;
+  double rho_2;
+  bool do_orthogonalization;
   int32 num_threads;
   IvectorExtractorEstimationOptions(): variance_floor_factor(0.1),
-                                       gaussian_min_count(100.0) { }
+                                       gaussian_min_count(100.0),
+									   tau(1.0),
+									   rho_1(1.0e-4),
+									   rho_2(0.9),
+                                                                           do_orthogonalization(false)
+									   { }
   void Register(OptionsItf *po) {
     po->Register("variance-floor-factor", &variance_floor_factor,
                  "Factor that determines variance flooring (we floor each covar "
@@ -326,6 +335,15 @@ struct IvectorExtractorEstimationOptions {
     po->Register("gaussian-min-count", &gaussian_min_count,
                  "Minimum total count per Gaussian, below which we refuse to "
                  "update any associated parameters.");
+    po->Register("do_orthogonalization", &do_orthogonalization,
+                 "Do orthogonalization on projection matrix after each iteration."
+                 "If set to false, tau, rho_1, and rho_2 has no effect.");
+    po->Register("tau", &tau,
+                 "Initial weight for Cayley transform.");
+    po->Register("rho_1", &rho_1,
+                 "Curvelinear search lower threshold.");
+    po->Register("rho_2", &rho_2,
+                 "Curvelinear search upper threshold.");
   }
 };
 
@@ -421,6 +439,17 @@ class IvectorStats {
   double UpdateProjection(const IvectorExtractorEstimationOptions &opts,
                           int32 gaussian,
                           IvectorExtractor *extractor) const;
+  // debug functions
+/*  double MySolveQuadraticMatrixProblemOnStiefelManifold(const SpMatrix<double> &Q,
+                                              const MatrixBase<double> &Y,
+                                              const SpMatrix<double> &SigmaInv,
+                                              const SolverOptions &opts,
+                                              MatrixBase<double> *M,
+                                              double tau,
+                                              double rho_1, 
+                                              double rho_2);*/
+  //
+
 
   // Updates the weight projections.  Returns the objf improvement per
   // frame.

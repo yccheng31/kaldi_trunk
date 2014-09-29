@@ -313,7 +313,7 @@ template<class Holder>  class SequentialTableReaderArchiveImpl:
   SequentialTableReaderArchiveImpl(): state_(kUninitialized) { }
 
   virtual bool Open(const std::string &rspecifier) {
-	std::cout<<"open archive for ["rspecifier<<"]"<<std::endl;
+	std::cout<<"open archive for ["<<rspecifier<<"]"<<std::endl;
     if (state_ != kUninitialized) {
       if (! Close()) {  // call Close() yourself to suppress this exception.
         if (opts_.permissive)
